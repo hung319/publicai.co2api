@@ -1,6 +1,4 @@
 // server.ts
-// DEBUG VERSION: LOG EVERYTHING
-
 const PORT = parseInt(Bun.env.PORT || "3000");
 const API_KEY = Bun.env.API_KEY || "1";
 const DEFAULT_MODEL = Bun.env.DEFAULT_MODEL || "publicai-gpt-4";
@@ -25,13 +23,12 @@ const generateId = (prefix = "") => {
   return prefix + result;
 };
 
-// --- Logger Helper ---
-const log = (tag: string, msg: any) => console.log(`[${new Date().toISOString()}] [${tag}]`, msg);
-
+// --- Core Logic: Upstream Caller ---
 async function* callUpstream(messages: any[], model: string) {
+    // 1. Sanitize Roles: Chuyển 'system' -> 'user' để tránh lỗi từ upstream
     const mappedMessages = messages.map((msg: any) => ({
         id: generateId(),
-        role: msg.role,
+        role: msg.role === 'system' ? 'user' : msg.role,
         parts: [{ type: 'text', text: msg.content }]
     }));
 
@@ -42,23 +39,14 @@ async function* callUpstream(messages: any[], model: string) {
         trigger: "submit-message"
     };
 
-    // [DEBUG] Log payload gửi đi
-    log("UPSTREAM_REQ", `Sending to PublicAI... Model: ${model}`);
-    // log("UPSTREAM_PAYLOAD", JSON.stringify(upstreamPayload)); // Uncomment nếu muốn xem full body gửi đi
-
     const response = await fetch('https://publicai.co/api/chat', {
         method: 'POST',
         headers: UPSTREAM_HEADERS,
         body: JSON.stringify(upstreamPayload)
     });
 
-    // [DEBUG] Log status nhận về
-    log("UPSTREAM_RES", `Status: ${response.status} ${response.statusText}`);
-    
     if (!response.ok) {
-        const errorText = await response.text();
-        log("UPSTREAM_ERR", errorText);
-        throw new Error(`Upstream Error: ${response.status} - ${errorText.substring(0, 200)}`);
+        throw new Error(`Upstream Error: ${response.status} ${response.statusText}`);
     }
 
     const reader = response.body?.getReader();
@@ -70,72 +58,67 @@ async function* callUpstream(messages: any[], model: string) {
     try {
         while (true) {
             const { done, value } = await reader.read();
-            if (done) {
-                log("STREAM", "Stream ended by server.");
-                break;
-            }
+            if (done) break;
 
-            const chunk = decoder.decode(value, { stream: true });
-            
-            // [DEBUG] Log raw chunk nhận được (cắt ngắn nếu quá dài để dễ nhìn)
-            // log("RAW_CHUNK", chunk.length > 100 ? chunk.substring(0, 100) + "..." : chunk);
-
-            buffer += chunk;
+            buffer += decoder.decode(value, { stream: true });
             const lines = buffer.split("\n");
             buffer = lines.pop() || "";
 
             for (const line of lines) {
                 if (line.trim().startsWith("data: ")) {
                     const jsonStr = line.replace("data: ", "").trim();
-                    if (jsonStr === "[DONE]") {
-                        log("STREAM", "Received [DONE] signal");
-                        return;
-                    }
+                    if (jsonStr === "[DONE]") return;
 
                     try {
                         const data = JSON.parse(jsonStr);
                         
-                        // [DEBUG] Log loại event nhận được
-                        // log("SSE_EVENT", `Type: ${data.type}`);
-
                         if (data.type === "text-delta" && data.delta) {
-                            // [DEBUG] Log content thực sự
-                            // process.stdout.write(data.delta); 
                             yield data.delta;
                         } else if (data.type === "error") {
-                            log("SSE_ERROR", data);
+                            // Ném lỗi để dừng stream và báo về client
+                            throw new Error(data.errorText || "Upstream Stream Error");
                         }
-                    } catch (e) {
-                        log("PARSE_ERR", `Failed to parse JSON: ${jsonStr}`);
+                    } catch (e: any) {
+                        // Re-throw nếu là lỗi logic, bỏ qua nếu là lỗi parse JSON rác
+                        if (e.message.includes("Upstream Stream Error")) throw e;
                     }
-                } else if (line.trim().length > 0) {
-                     // [DEBUG] Cảnh báo nếu dòng không bắt đầu bằng "data:" (có thể là HTML lỗi)
-                     log("WARN_LINE", `Unexpected line: ${line.substring(0, 50)}`);
                 }
             }
         }
-    } catch (err) {
-        log("STREAM_ERR", err);
-        throw err;
     } finally {
         reader.releaseLock();
     }
 }
 
-console.log(`🚀 Debug Proxy running on port ${PORT}`);
+// --- Server Definition ---
+console.log(`🚀 Production Proxy running on port ${PORT}`);
 
 Bun.serve({
     port: PORT,
     async fetch(req) {
         const url = new URL(req.url);
 
-        // Auth
+        // 1. Auth Middleware
         const authHeader = req.headers.get("Authorization");
         const token = authHeader?.replace("Bearer ", "");
         if (token !== API_KEY) {
-            return new Response(JSON.stringify({ error: { message: "Invalid API Key" } }), { status: 401 });
+            return new Response(JSON.stringify({ error: { message: "Invalid API Key", type: "invalid_request_error" } }), { status: 401, headers: { "Content-Type": "application/json" } });
         }
 
+        // 2. Endpoint: /v1/models
+        if (req.method === "GET" && url.pathname === "/v1/models") {
+            return new Response(JSON.stringify({
+                object: "list",
+                data: [{
+                    id: DEFAULT_MODEL,
+                    object: "model",
+                    created: Math.floor(Date.now() / 1000),
+                    owned_by: "publicai"
+                }]
+            }), { headers: { "Content-Type": "application/json" } });
+        }
+
+        // 3. Endpoint: /v1/chat/completions
         if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
             try {
                 const body = await req.json();
@@ -143,12 +126,11 @@ Bun.serve({
                 const stream = body.stream === true;
                 const model = body.model || DEFAULT_MODEL;
 
-                log("CLIENT_REQ", `Stream: ${stream}, Messages: ${messages.length}`);
-
                 const generator = callUpstream(messages, model);
                 const created = Math.floor(Date.now() / 1000);
                 const id = generateId("chatcmpl-");
 
+                // --- Case A: Streaming Response ---
                 if (stream) {
                     const encoder = new TextEncoder();
                     const streamResponse = new ReadableStream({
@@ -162,9 +144,9 @@ Bun.serve({
                                     controller.enqueue(encoder.encode(`data: ${JSON.stringify(ssePayload)}\n\n`));
                                 }
                                 controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-                            } catch (e) {
-                                log("STREAM_FAIL", e);
-                                const errPayload = { error: { message: "Upstream stream failed" } };
+                            } catch (e: any) {
+                                // Gửi error chunk trong stream nếu lỗi xảy ra giữa chừng
+                                const errPayload = { error: { message: e.message || "Stream interrupted" } };
                                 controller.enqueue(encoder.encode(`data: ${JSON.stringify(errPayload)}\n\n`));
                             } finally {
                                 controller.close();
@@ -175,39 +157,25 @@ Bun.serve({
                     return new Response(streamResponse, {
                         headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" }
                     });
-                } else {
+                }
+
+                // --- Case B: Non-Streaming Response ---
+                else {
                     let fullContent = "";
-                    try {
-                        for await (const chunk of generator) {
-                            fullContent += chunk;
-                        }
-                        
-                        log("NON_STREAM", `Completed. Length: ${fullContent.length}`);
-
-                        if (!fullContent) {
-                            log("WARN", "Full content is empty!");
-                        }
-
-                        return new Response(JSON.stringify({
-                            id, object: "chat.completion", created, model,
-                            choices: [{ index: 0, message: { role: "assistant", content: fullContent }, finish_reason: "stop" }],
-                            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-                        }), { headers: { "Content-Type": "application/json" } });
-
-                    } catch (e: any) {
-                        return new Response(JSON.stringify({ error: { message: e.message } }), { status: 500, headers: { "Content-Type": "application/json" } });
+                    for await (const chunk of generator) {
+                        fullContent += chunk;
                     }
+
+                    return new Response(JSON.stringify({
+                        id, object: "chat.completion", created, model,
+                        choices: [{ index: 0, message: { role: "assistant", content: fullContent }, finish_reason: "stop" }],
+                        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+                    }), { headers: { "Content-Type": "application/json" } });
                 }
 
             } catch (error: any) {
-                log("SERVER_ERR", error);
-                return new Response(JSON.stringify({ error: { message: error.message } }), { status: 500 });
+                return new Response(JSON.stringify({ error: { message: error.message || "Internal Server Error" } }), { status: 500, headers: { "Content-Type": "application/json" } });
             }
-        }
-        
-        // Models endpoint (giữ nguyên)
-        if (req.method === "GET" && url.pathname === "/v1/models") {
-             return new Response(JSON.stringify({ object: "list", data: [{ id: DEFAULT_MODEL, object: "model", created: Date.now(), owned_by: "publicai" }] }), { headers: { "Content-Type": "application/json" } });
         }
 
         return new Response("Not Found", { status: 404 });
